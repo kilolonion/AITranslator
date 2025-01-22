@@ -1,4 +1,6 @@
-# AITrans
+# AITrans 支持多款常见API的AI翻译器
+
+[中文](README.md) | [English](README_EN.md)
 
 AITrans 是一个强大的 AI 驱动的翻译库，支持多种语言之间的高质量翻译。
 
