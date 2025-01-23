@@ -1,7 +1,7 @@
 import os
 from dotenv import load_dotenv
 import openai
-from typing import List, Union, Dict, Optional, Tuple, Any, AsyncGenerator, Generator
+from typing import List, Union, Dict, Optional, Tuple, Any, AsyncGenerator, Generator, Callable
 import json
 import logging
 import time
@@ -183,15 +183,16 @@ LANG_CODE_MAP = {
 class AITranslated:
     """表示翻译结果的类"""
 
-    def __init__(self, src, dest, origin, text, pronunciation=None):
+    def __init__(self, src, dest, origin, text, pronunciation=None, metadata=None):
         self.src = src
         self.dest = dest
         self.origin = origin
         self.text = text
         self.pronunciation = pronunciation
+        self.metadata = metadata or {}
 
     def __repr__(self):
-        return f'<AITranslated src={self.src} dest={self.dest} text={self.text} pronunciation={self.pronunciation}>'
+        return f'<AITranslated src={self.src} dest={self.dest} text={self.text} pronunciation={self.pronunciation} metadata={self.metadata}>'
 
 
 @dataclass
@@ -213,6 +214,43 @@ class AIDetected:
         if self.details:
             return f'<AIDetected lang={self.lang} confidence={self.confidence:.3f} details={self.details}>'
         return f'<AIDetected lang={self.lang} confidence={self.confidence:.3f}>'
+
+
+@dataclass
+class TranslationProgress:
+    """翻译进度信息"""
+    completed: int
+    total: int
+    current_text: str
+    status: str = 'translating'
+    error: str = None
+
+    @property
+    def percent(self) -> float:
+        """计算完成百分比"""
+        return (self.completed / self.total) * 100 if self.total > 0 else 0
+
+
+class TranslationRecoveryState:
+    """管理翻译恢复状态"""
+
+    def __init__(self):
+        self.attempts = 0
+        self.last_error = None
+        self.recovery_strategy = None
+        self.partial_results = []
+        self.start_time = time.time()
+
+    def record_attempt(self, error: Exception):
+        self.attempts += 1
+        self.last_error = error
+
+    def add_partial_result(self, result: AITranslated):
+        self.partial_results.append(result)
+
+    @property
+    def duration(self) -> float:
+        return time.time() - self.start_time
 
 
 class PerformanceMetrics:
@@ -381,6 +419,172 @@ class BatchProcessor:
         logger.debug("BatchProcessor stopped")
 
 
+class SmartBatchProcessor:
+    """智能批处理处理器，支持基于token的动态批处理"""
+    def __init__(self, max_batch_size=10, max_tokens=4000):
+        self.max_batch_size = max_batch_size
+        self.max_tokens = max_tokens
+        self.current_batch = []
+        self.current_tokens = 0
+        self._is_initialized = False
+        self.semaphore = None
+
+    async def initialize(self):
+        """初始化处理器"""
+        if not self._is_initialized:
+            self.semaphore = asyncio.Semaphore(self.max_batch_size)
+            self._is_initialized = True
+
+    def estimate_tokens(self, text: str) -> int:
+        """估算文本的token数量"""
+        return len(text.split()) * 1.3  # 简单估算
+
+    def can_add_to_batch(self, text: str) -> bool:
+        """检查是否可以添加到当前批次"""
+        estimated_tokens = self.estimate_tokens(text)
+        return (len(self.current_batch) < self.max_batch_size and 
+                self.current_tokens + estimated_tokens <= self.max_tokens)
+
+    def add_to_batch(self, text: str) -> bool:
+        """添加文本到批次"""
+        if not self.can_add_to_batch(text):
+            return False
+        self.current_batch.append(text)
+        self.current_tokens += self.estimate_tokens(text)
+        return True
+
+    def get_current_batch(self) -> List[str]:
+        """获取当前批次并清空"""
+        batch = self.current_batch[:]
+        self.current_batch = []
+        self.current_tokens = 0
+        return batch
+
+    async def process_batch(self, processor_func: Callable) -> List[Any]:
+        """处理当前批次"""
+        if not self.current_batch:
+            return []
+        batch = self.get_current_batch()
+        async with self.semaphore:
+            return await processor_func(batch)
+
+
+class DynamicRateLimiter:
+    """动态请求限流控制器"""
+    def __init__(self, initial_rate=10, max_rate=20):
+        self.current_rate = initial_rate
+        self.max_rate = max_rate
+        self.success_count = 0
+        self.failure_count = 0
+        self.window_size = 60  # 60秒窗口
+        self.last_adjustment = time.time()
+        self._lock = asyncio.Lock()
+
+    async def adjust_rate(self, success: bool):
+        """根据请求成功/失败动态调整速率"""
+        async with self._lock:
+            current_time = time.time()
+            if current_time - self.last_adjustment >= self.window_size:
+                # 重置计数器
+                self.success_count = 0
+                self.failure_count = 0
+                self.last_adjustment = current_time
+
+            if success:
+                self.success_count += 1
+                if self.success_count > 10 and self.current_rate < self.max_rate:
+                    self.current_rate = min(self.current_rate * 1.2, self.max_rate)
+            else:
+                self.failure_count += 1
+                if self.failure_count > 2:
+                    self.current_rate = max(self.current_rate * 0.8, 1)
+
+    async def wait(self):
+        """等待下一个请求的时间间隔"""
+        wait_time = 1 / self.current_rate
+        await asyncio.sleep(wait_time)
+
+
+class SmartRetryHandler:
+    """智能重试处理器"""
+    def __init__(self):
+        self.error_counts = defaultdict(int)
+        self.last_errors = defaultdict(list)
+        self.max_retries = 5
+
+    def should_retry(self, error: Exception) -> Tuple[bool, float]:
+        """判断是否应该重试并返回等待时间"""
+        error_type = type(error).__name__
+        self.error_counts[error_type] += 1
+        
+        if self.error_counts[error_type] > self.max_retries:
+            return False, 0
+
+        if isinstance(error, (openai.APIError, httpx.ConnectError)):
+            wait_time = min(2 ** self.error_counts[error_type], 32)
+            return True, wait_time
+            
+        if isinstance(error, openai.RateLimitError):
+            wait_time = 60  # 固定等待时间
+            return True, wait_time
+            
+        return False, 0
+
+    def reset_error_count(self, error_type: str):
+        """重置错误计数"""
+        self.error_counts[error_type] = 0
+
+
+class EnhancedCache:
+    """增强的缓存实现"""
+    def __init__(self, ttl=3600):
+        self.cache = {}
+        self.ttl = ttl
+        self.hits = 0
+        self.misses = 0
+        self._lock = asyncio.Lock()
+
+    async def get(self, key: str) -> Optional[str]:
+        """获取缓存值"""
+        async with self._lock:
+            if key in self.cache:
+                entry = self.cache[key]
+                if time.time() - entry['timestamp'] < self.ttl:
+                    self.hits += 1
+                    return entry['value']
+            self.misses += 1
+            return None
+
+    async def put(self, key: str, value: str):
+        """存入缓存值"""
+        async with self._lock:
+            self.cache[key] = {
+                'value': value,
+                'timestamp': time.time()
+            }
+
+    async def cleanup(self):
+        """清理过期缓存"""
+        async with self._lock:
+            current_time = time.time()
+            expired_keys = [
+                k for k, v in self.cache.items()
+                if current_time - v['timestamp'] >= self.ttl
+            ]
+            for k in expired_keys:
+                del self.cache[k]
+
+    def get_stats(self) -> Dict[str, float]:
+        """获取缓存统计信息"""
+        total = self.hits + self.misses
+        hit_rate = self.hits / total if total > 0 else 0
+        return {
+            'hits': self.hits,
+            'misses': self.misses,
+            'hit_rate': hit_rate
+        }
+
+
 class AITranslator:
     """AI翻译器类"""
 
@@ -545,6 +749,18 @@ class AITranslator:
         self.session = None
         self.semaphore = asyncio.Semaphore(max_workers)
 
+        # 优化组件
+        self.smart_batch_processor = SmartBatchProcessor(
+            max_batch_size=self.perf_config.get('max_batch_size', 10),
+            max_tokens=self.perf_config.get('max_tokens', 4000)
+        )
+        self.rate_limiter = DynamicRateLimiter(
+            initial_rate=self.perf_config.get('initial_rate', 10),
+            max_rate=self.perf_config.get('max_rate', 20)
+        )
+        self.retry_handler = SmartRetryHandler()
+        self.enhanced_cache = EnhancedCache(ttl=self._cache_ttl)
+
     def _init_style_templates(self):
         """初始化翻译风格模板"""
         self.style_templates = {
@@ -625,15 +841,19 @@ class AITranslator:
 
     async def _make_request(self, messages, stream=False):
         """改进的异步请求处理，支持预连接模式"""
-        async with self._request_lock:  # 使用请求锁控制并发
-            current_time = time.time()
-            time_since_last_request = current_time - self._last_request_time
-            if time_since_last_request < self._min_request_interval:
-                await asyncio.sleep(self._min_request_interval - time_since_last_request)
-
+        async with self._request_lock:
+            # 使用动态限流
+            await self.rate_limiter.wait()
+            
             start_time = time.time()
-
+            
             try:
+                # 检查缓存
+                cache_key = self._get_cache_key(messages)
+                cached_response = await self.enhanced_cache.get(cache_key)
+                if cached_response:
+                    return cached_response
+
                 # 验证API密钥
                 if not self.api_key or len(self.api_key) < 32:
                     raise AIAuthenticationError("无效的API密钥")
@@ -641,7 +861,7 @@ class AITranslator:
                 # 使用预连接的客户端或创建新的客户端
                 client = self._preconnected_client if self._is_preconnected else await self.client_manager.get_client()
 
-                async with self.semaphore:  # 使用信号量控制并发
+                async with self.semaphore:
                     try:
                         completion = await client.chat.completions.create(
                             model=self.model,
@@ -651,152 +871,82 @@ class AITranslator:
                             max_tokens=self.perf_config['max_tokens'],
                             timeout=self.perf_config['timeout']
                         )
-                    except openai.AuthenticationError as e:
-                        self.metrics.record_request(
-                            time.time() - start_time, False)
-                        raise AIAuthenticationError(f"API认证失败: {str(e)}")
-                    except openai.APIError as e:
-                        self.metrics.record_request(
-                            time.time() - start_time, False)
-                        if "auth" in str(e).lower():
-                            raise AIAuthenticationError(f"API认证失败: {str(e)}")
+                        
+                        # 记录成功并调整速率
+                        await self.rate_limiter.adjust_rate(True)
+                        
+                        # 缓存响应
+                        if not stream:
+                            await self.enhanced_cache.put(cache_key, completion)
+                            
+                        return completion
+                        
+                    except Exception as e:
+                        # 记录失败并调整速率
+                        await self.rate_limiter.adjust_rate(False)
+                        
+                        # 智能重试处理
+                        should_retry, wait_time = self.retry_handler.should_retry(e)
+                        if should_retry:
+                            await asyncio.sleep(wait_time)
+                            return await self._make_request(messages, stream)
+                            
                         raise
 
-                    self._last_request_time = time.time()
-                    duration = time.time() - start_time
+            finally:
+                duration = time.time() - start_time
+                await self._record_metrics(duration, True)
 
-                    if stream:
-                        self.metrics.record_request(duration, True)
-                        return completion
-                    else:
-                        if hasattr(completion, 'choices') and completion.choices:
-                            result = completion.choices[0].message.content.strip(
-                            )
-                            self.metrics.record_request(duration, True)
-                            return result
-                        else:
-                            self.metrics.record_request(duration, False)
-                            raise AIAPIError("Invalid API response format")
+    async def translate_batch(self, texts: List[str], dest='en', src='auto',
+                          progress_callback: Callable[[TranslationProgress], None] = None):
+        """改进的批量翻译实现"""
+        results = []
+        total_texts = len(texts)
+        completed = 0
 
-            except Exception as e:
-                self.metrics.record_request(time.time() - start_time, False)
-                raise
+        async def process_batch(batch: List[str]) -> List[AITranslated]:
+            nonlocal completed
+            batch_results = []
+            
+            for text in batch:
+                try:
+                    result = await self._translate_single(text, dest, src)
+                    batch_results.append(result)
+                    completed += 1
+                    
+                    if progress_callback:
+                        progress = TranslationProgress(
+                            completed=completed,
+                            total=total_texts,
+                            current_text=text
+                        )
+                        progress_callback(progress)
+                        
+                except Exception as e:
+                    logger.error(f"批量翻译错误: {str(e)}")
+                    batch_results.append(None)
+                    completed += 1
+                    
+            return batch_results
 
-    async def _record_metrics(self, duration: float, success: bool) -> None:
-        """异步安全的指标记录"""
-        async with self._metrics_lock:
-            self.metrics.record_request(duration, success)
+        # 使用智能批处理
+        for text in texts:
+            if self.smart_batch_processor.add_to_batch(text):
+                continue
+                
+            # 当前批次已满，处理它
+            batch_results = await self.smart_batch_processor.process_batch(process_batch)
+            results.extend(batch_results)
+            
+            # 添加新文本到新批次
+            self.smart_batch_processor.add_to_batch(text)
 
-    def _get_cache_key(self, messages):
-        """生成缓存键"""
-        # 只使用消息内容和角色生成缓存键
-        key_parts = [f"{m['role']}:{m['content']}" for m in messages]
-        return hash(tuple(key_parts))
+        # 处理最后的批次
+        if self.smart_batch_processor.current_batch:
+            batch_results = await self.smart_batch_processor.process_batch(process_batch)
+            results.extend(batch_results)
 
-    def _get_from_cache(self, key):
-        """从缓存获取响应"""
-        if key in self._response_cache:
-            cached_item = self._response_cache[key]
-            if time.time() - cached_item['timestamp'] < self._cache_ttl:
-                return cached_item['response']
-            else:
-                del self._response_cache[key]
-        return None
-
-    def _add_to_cache(self, key, response):
-        """添加响应到缓存"""
-        self._response_cache[key] = {
-            'response': response,
-            'timestamp': time.time()
-        }
-
-        # 清理过期缓存
-        self._cleanup_cache()
-
-    def _cleanup_cache(self):
-        """清理过期缓存"""
-        current_time = time.time()
-        expired_keys = [
-            k for k, v in self._response_cache.items()
-            if current_time - v['timestamp'] > self._cache_ttl
-        ]
-        for k in expired_keys:
-            del self._response_cache[k]
-
-    async def _init_session(self):
-        """初始化异步会话"""
-        if self.session is None:
-            self.session = aiohttp.ClientSession()
-
-    async def _close_session(self):
-        """关闭异步会话"""
-        if self.session:
-            await self.session.close()
-            self.session = None
-
-    async def translate_batch(self, texts: List[str], dest='en', src='auto', batch_size=10) -> List[AITranslated]:
-        """异步批量翻译
-
-        Args:
-            texts: 要翻译的文本列表
-            dest: 目标语言代码
-            src: 源语言代码（auto为自动检测）
-            batch_size: 每批处理的文本数量
-
-        Returns:
-            翻译结果列表
-        """
-        if not texts:
-            return []
-
-        start_time = time.time()
-        processor = BatchProcessor(
-            max_workers=self.perf_config['max_workers'],
-            batch_size=batch_size
-        )
-
-        async def translate_single(text: str) -> AITranslated:
-            try:
-                return await self._translate_single(text, dest, src, False)
-            except Exception as e:
-                logger.error(
-                    f"Translation failed: {text[:50]}... Error: {str(e)}")
-                return AITranslated(
-                    src=src,
-                    dest=dest,
-                    origin=text,
-                    text=f"Translation failed: {str(e)}"
-                )
-
-        try:
-            results = await processor.process(texts, translate_single)
-
-            duration = time.time() - start_time
-            success_count = sum(
-                1 for r in results if r and not r.text.startswith("Translation failed"))
-            logger.info(
-                f"Batch translation completed in {duration:.2f}s - {len(texts)} texts, {success_count} successful")
-
-            return results
-        finally:
-            await processor.stop()
-
-    def translate_batch_sync(self, texts: List[str], dest='en', src='auto') -> List[AITranslated]:
-        """同步批量翻译实现
-
-        Args:
-            texts: 要翻译的文本列表
-            dest: 目标语言代码
-            src: 源语言代码（auto为自动检测）
-
-        Returns:
-            翻译结果列表
-        """
-        try:
-            return asyncio.run(self.translate_batch(texts, dest, src))
-        except Exception as e:
-            logger.error(f"Sync batch translation failed: {str(e)}")
-            return [AITranslated(src, dest, text, f"Translation failed: {str(e)}") for text in texts]
+        return results
 
     def load_glossary(self, path: Union[str, Path]) -> None:
         """
@@ -908,7 +1058,7 @@ class AITranslator:
         """
         return self.glossary.get(term_id)
 
-    async def _translate_single(self, text: str, dest: str, src: str, stream: bool):
+    async def _translate_single(self, text: str, dest: str, src: str, stream: bool = False) -> AITranslated:
         """单个文本翻译实现"""
         try:
             text = text.strip()
@@ -937,7 +1087,7 @@ class AITranslator:
             ]
 
             start_time = time.time()
-            translated_text = await self._make_request(messages, stream=False)
+            translated_text = await self._make_request(messages, stream=stream)
             duration = time.time() - start_time
             self.metrics.record_request(duration, True)
 
@@ -1086,8 +1236,7 @@ class AITranslator:
                 return fallback_lang
 
     async def translate(self, text: Union[str, List[str]], dest='en', src='auto', stream=False) -> Union[AITranslated, List[AITranslated], AsyncGenerator[AITranslated, None]]:
-        """
-        翻译文本，支持批量处理和流式翻译
+        """翻译文本，支持批量处理和流式翻译
 
         Args:
             text: 要翻译的源文本（字符串或字符串列表）
@@ -1096,7 +1245,7 @@ class AITranslator:
             stream: 是否使用流式翻译
 
         Returns:
-            翻译结果或生成器（流式翻译时）
+            翻译结果或生成器
         """
         # 验证语言代码
         if src != 'auto' and src not in DOUBAO_LANGUAGES:
@@ -1114,19 +1263,12 @@ class AITranslator:
         if not text:
             return AITranslated(src, dest, text, text)
 
-        if not stream:
+        if stream:
+            current_src = src if src != 'auto' else await self._detect_language_with_fallback(text)
+            return StreamTranslator(self, text, dest, current_src)
+        else:
             result = await self._translate_single(text, dest, src, False)
             return result
-
-        # 流式翻译逻辑
-        current_src = src if src != 'auto' else await self._detect_language_with_fallback(text)
-        prompt = f"将以下{current_src}文本翻译成{dest}：\n{text}"
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": prompt}
-        ]
-
-        return await self._create_stream_generator(messages, current_src, dest, text)
 
     async def translate_with_context(self, text: str, context: str, dest='en', src='auto', style_guide=None, stream=False) -> Union[AITranslated, AsyncGenerator[AITranslated, None]]:
         """
@@ -1253,7 +1395,8 @@ class AITranslator:
 
             messages = [
                 {"role": "system", "content": "你是一个专业的翻译手，请按照指定的风格要求进行翻译。"},
-                {"role": "user", "content": f"""
+                {"role": "user",
+                    "content": f"""
 {style_prompt}
 
 {context_part}
@@ -1386,6 +1529,51 @@ class AITranslator:
                     f"{field} must be of type {field_type.__name__}")
             if not validator(value):
                 raise ValueError(f"Invalid value for {field}: {value}")
+
+    def _get_retry_config(self):
+        """获取更智能的重试配置"""
+        return {
+            'multiplier': self.perf_config.get('retry_multiplier', 0.5),
+            'min': self.perf_config.get('retry_min_wait', 1),
+            'max': self.perf_config.get('retry_max_wait', 4),
+            'max_retries': self.perf_config.get('max_retries', 3),
+            'retry_on_errors': {
+                'network': True,      # 网络错误
+                'rate_limit': True,   # 速率限制
+                'server': True,       # 服务器错误
+                'timeout': True,      # 超时
+                'auth': False         # 认证错误不重试
+            }
+        }
+
+    async def _should_retry(self, error: Exception, attempt: int) -> Tuple[bool, float]:
+        """判断是否应该重试并返回等待时间"""
+        retry_config = self._get_retry_config()
+
+        if attempt >= retry_config['max_retries']:
+            return False, 0
+
+        if isinstance(error, openai.RateLimitError):
+            if not retry_config['retry_on_errors']['rate_limit']:
+                return False, 0
+            wait_time = getattr(error, 'retry_after', 30)
+
+        elif isinstance(error, (httpx.ConnectError, httpx.ReadTimeout)):
+            if not retry_config['retry_on_errors']['network']:
+                return False, 0
+            wait_time = min(retry_config['multiplier'] * (2 ** attempt),
+                            retry_config['max'])
+
+        elif isinstance(error, openai.APIError):
+            if not retry_config['retry_on_errors']['server']:
+                return False, 0
+            wait_time = min(retry_config['multiplier'] * (2 ** attempt),
+                            retry_config['max'])
+
+        else:
+            return False, 0
+
+        return True, max(wait_time, retry_config['min'])
 
     async def __aenter__(self):
         """异步上下文管理器入口"""
@@ -1522,6 +1710,34 @@ class AITranslator:
             logger.error(f"清理资源失败: {str(e)}")
             raise AIError(f"清理资源失败: {str(e)}")
 
+    async def translate_with_recovery(self, text: str, dest='en', src='auto',
+                                      progress_callback=None) -> AITranslated:
+        """带恢复机制的翻译方法"""
+        recovery_state = TranslationRecoveryState()
+
+        while recovery_state.attempts < self.max_retries:
+            try:
+                if progress_callback:
+                    progress_callback(recovery_state.attempts, "正在尝试翻译...")
+
+                result = await self.translate(text, dest, src)
+                return result
+
+            except Exception as e:
+                recovery_state.record_attempt(e)
+                should_retry, wait_time = await self._should_retry(e, recovery_state.attempts)
+
+                if not should_retry:
+                    raise AIError(f"翻译失败，无法恢复: {str(e)}")
+
+                if progress_callback:
+                    progress_callback(recovery_state.attempts,
+                                      f"遇到错误，{wait_time}秒后重试...")
+
+                await asyncio.sleep(wait_time)
+
+        raise AIError(f"达到最大重试次数 ({self.max_retries})，翻译失败")
+
 
 class DocumentTranslator:
     """文档翻译器"""
@@ -1619,62 +1835,105 @@ class DocumentTranslator:
 
 
 class StreamTranslator:
-    """流式翻译迭代器"""
+    """流式翻译的异步迭代器实现"""
 
-    def __init__(self, translator, text: str, dest: str, src: str):
+    def __init__(self, translator: 'AITranslator', text: str, dest: str, src: str):
         self.translator = translator
         self.text = text
         self.dest = dest
         self.src = src
+        self._response_stream = None
+        self._accumulated_text = ""
+        self._is_first_chunk = True
+        self._translation_complete = False
+        self._request_sent = False
 
-    async def __aiter__(self):
-        """实现异步迭代器协议"""
-        text = self.text.strip()
-        if not text:
-            yield AITranslated(self.src, self.dest, text, text)
-            return
+    def __aiter__(self):
+        return self
 
-        if self.src == 'auto':
+    async def __anext__(self):
+        """实现异步迭代器的下一个值获取"""
+        try:
+            if self._translation_complete:
+                raise StopAsyncIteration
+
+            # 初始化流式响应（只在第一次调用时执行）
+            if not self._request_sent:
+                self._request_sent = True
+                client = await self.translator.client_manager.get_client()
+                messages = [
+                    {"role": "system", "content": self.translator.system_prompt},
+                    {"role": "user",
+                        "content": f"将以下{self.src}文本翻译成{self.dest}：\n{self.text}"}
+                ]
+
+                self._response_stream = await client.chat.completions.create(
+                    model=self.translator.model,
+                    messages=messages,
+                    stream=True,
+                    temperature=self.translator.perf_config['temperature'],
+                    max_tokens=self.translator.perf_config['max_tokens']
+                )
+
             try:
-                detected = await self.translator.detect(text)
-                self.src = detected.lang
-            except Exception as e:
-                logger.warning(
-                    f"Language detection failed, using 'auto': {str(e)}")
-                # 如果检测失败，尝试使用备用检测方法
-                try:
-                    detected = await self.translator.detect_enhanced(text)
-                    self.src = detected.lang
-                except Exception as e2:
-                    logger.error(f"Enhanced detection also failed: {str(e2)}")
-                    self.src = 'en'  # 使用默认语言而不是 'auto'
+                chunk = await anext(self._response_stream)
 
-        prompt = f"将以下{self.src}文本翻译成{self.dest}：\n{text}"
-        messages = [
-            {"role": "system", "content": self.translator.system_prompt},
-            {"role": "user", "content": prompt}
-        ]
+                # 检查chunk是否有效并包含内容
+                if (hasattr(chunk, 'choices') and
+                    chunk.choices and
+                    hasattr(chunk.choices[0], 'delta') and
+                    hasattr(chunk.choices[0].delta, 'content') and
+                        chunk.choices[0].delta.content):
 
-        retry_count = 0
-        max_retries = self.translator.max_retries
-        while retry_count <= max_retries:
-            try:
-                response_stream = await self.translator._make_request(messages, stream=True)
-                translated_text = ""
-                async for chunk in response_stream:
-                    if chunk.choices and chunk.choices[0].delta.content:
-                        translated_text += chunk.choices[0].delta.content
-                        yield AITranslated(self.src, self.dest, text, translated_text)
-                break  # 成功完成，退出重试循环
-            except Exception as e:
-                retry_count += 1
-                if retry_count > max_retries:
-                    logger.error(
-                        f"Streaming translation failed after {max_retries} retries: {str(e)}")
-                    raise AIAPIError(f"流式翻译失败: {str(e)}")
-                logger.warning(
-                    f"Retry {retry_count}/{max_retries} due to: {str(e)}")
-                await asyncio.sleep(2 ** retry_count)  # 指数退避
+                    # 累积文本
+                    content = chunk.choices[0].delta.content
+                    self._accumulated_text += content
+
+                    return AITranslated(
+                        self.src,
+                        self.dest,
+                        self.text,
+                        self._accumulated_text,
+                        metadata={
+                            'status': 'streaming',
+                            'is_partial': True,
+                            'is_first_chunk': self._is_first_chunk,
+                            'progress': len(self._accumulated_text) / len(self.text) * 100
+                        }
+                    )
+
+                # 如果chunk无效，继续获取下一个
+                return await self.__anext__()
+
+            except StopAsyncIteration:
+                if not self._translation_complete:
+                    self._translation_complete = True
+                    if self._accumulated_text:
+                        return AITranslated(
+                            self.src,
+                            self.dest,
+                            self.text,
+                            self._accumulated_text,
+                            metadata={
+                                'status': 'completed',
+                                'is_partial': False,
+                                'progress': 100
+                            }
+                        )
+                raise
+
+        except Exception as e:
+            logger.error(f"流式翻译错误: {str(e)}")
+            self._cleanup()
+            raise AIError(f"流式翻译错误: {str(e)}")
+
+    def _cleanup(self):
+        """清理资源"""
+        self._response_stream = None
+        self._accumulated_text = ""
+        self._is_first_chunk = True
+        self._translation_complete = True
+        self._request_sent = False
 
 
 class AITranslatorSync:
@@ -1779,14 +2038,6 @@ class AITranslatorSync:
             self._initialized = False
         except Exception as e:
             logger.error(f"清理资源失败: {str(e)}")
-
-    async def _cleanup_resources(self):
-        """清理所有资源"""
-        try:
-            if hasattr(self, 'translator') and self.translator:
-                await self.translator.cleanup()
-        except Exception as e:
-            logger.error(f"资源清理失败: {str(e)}")
 
     async def _cleanup_resources(self):
         """清理所有资源"""
@@ -2023,6 +2274,182 @@ def test_examples():
         print(f"错误处理测试失败: {e}")
 
 
+# ============= 使用示例和测试代码 =============
+
+async def test_basic_translation():
+    """基础翻译功能测试"""
+    translator = AITranslator()
+    try:
+        # 单文本翻译测试
+        result = await translator.translate("Hello world!", dest="zh")
+        print(f"基础翻译测试: {result.text}")
+
+        # 批量翻译测试
+        texts = ["Hello", "Good morning", "Good night"]
+        results = await translator.translate_batch(texts, dest="zh")
+        print("\n批量翻译测试:")
+        for i, result in enumerate(results, 1):
+            print(f"  {i}. {result.text}")
+
+    except AIError as e:
+        print(f"翻译错误: {str(e)}")
+    finally:
+        await translator.cleanup()
+
+
+async def test_error_recovery():
+    """测试翻译错误恢复功能"""
+    translator = AITranslator()
+    text = "这是一个测试文本。" * 5  # 重复文本以增加处理时间
+
+    # 模拟网络错误
+    translator.api_base = "https://nonexistent-api.example.com"
+
+    try:
+        print("\n开始错误恢复测试...")
+        result = await translator.translate(text, dest='en', src='zh')
+        print(f"翻译结果: {result.text}")
+        print("测试失败: 应该抛出异常")
+    except AIError as e:
+        print(f"预期的错误: {str(e)}")
+        # 恢复正确的API地址
+        translator.api_base = "https://api.openai.com/v1"
+
+        try:
+            # 重试翻译
+            result = await translator.translate(text, dest='en', src='zh')
+            print(f"恢复后的翻译: {result.text}")
+            print("错误恢复测试通过!")
+        except Exception as e:
+            print(f"恢复失败: {str(e)}")
+            raise
+
+
+async def test_stream_translation():
+    """流式翻译测试"""
+    translator = AITranslator()
+    try:
+        text = "This is a test text for streaming translation."
+        print(f"\n开始流式翻译测试: '{text}'")
+
+        stream_translator = await translator.translate(text, dest="zh", stream=True)
+
+        async for partial in stream_translator:
+            status = partial.metadata.get('status', '')
+            is_partial = partial.metadata.get('is_partial', True)
+
+            if is_partial:
+                print(f"部分译文: {partial.text}")
+            else:
+                print(f"翻译完成！最终结果: {partial.text}")
+                break  # 收到完整结果后退出
+
+    except AIError as e:
+        print(f"流式翻译错误: {str(e)}")
+    finally:
+        await translator.cleanup()
+
+
+async def test_batch_with_progress():
+    """批量翻译进度测试"""
+    translator = AITranslator()
+    try:
+        texts = [f"第{i}段测试文本。" for i in range(1, 6)]
+        print("\n开始批量翻译测试...")
+
+        def progress_callback(progress: TranslationProgress):
+            """进度回调函数"""
+            print(f"进度: {progress.percent:.1f}% - "
+                  f"完成: {progress.completed}/{progress.total} - "
+                  f"当前文本: {progress.current_text}")
+
+        results = await translator.translate_batch(
+            texts,
+            dest="en",
+            progress_callback=progress_callback
+        )
+
+        print("\n翻译结果:")
+        for i, result in enumerate(results, 1):
+            print(f"{i}. {result.text}")
+
+        print("批量翻译测试通过!")
+        return True
+
+    except Exception as e:
+        print(f"批量翻译测试失败: {str(e)}")
+        return False
+    finally:
+        await translator.cleanup()
+
+
+async def test_error_handling():
+    """测试各种错误情况的处理"""
+    translator = AITranslator()
+
+    print("\n开始错误处理测试...")
+
+    # 测试空文本
+    try:
+        result = await translator.translate("", dest='en')
+        assert result.text == "", "空文本应该返回空结果"
+        print("✓ 空文本测试通过")
+    except Exception as e:
+        print(f"✗ 空文本测试失败: {str(e)}")
+
+    # 测试无效的源语言
+    try:
+        await translator.translate("测试文本", src='invalid', dest='en')
+        print("✗ 无效源语言测试失败: 应该抛出异常")
+    except AIError as e:
+        if "不支持的源语言" in str(e):
+            print("✓ 无效源语言测试通过")
+        else:
+            print(f"✗ 无效源语言测试失败: {str(e)}")
+
+    # 测试无效的目标语言
+    try:
+        await translator.translate("测试文本", src='zh', dest='invalid')
+        print("✗ 无效目标语言测试失败: 应该抛出异常")
+    except AIError as e:
+        if "不支持的目标语言" in str(e):
+            print("✓ 无效目标语言测试通过")
+        else:
+            print(f"✗ 无效目标语言测试失败: {str(e)}")
+
+    # 测试流式翻译的批量处理
+    try:
+        await translator.translate(["文本1", "文本2"], stream=True)
+        print("✗ 流式批量测试失败: 应该抛出异常")
+    except ValueError as e:
+        if "流式翻译不支持批量处理" in str(e):
+            print("✓ 流式批量测试通过")
+        else:
+            print(f"✗ 流式批量测试失败: {str(e)}")
+
+    print("错误处理测试完成")
+
+
+async def run_tests():
+    """运行所有测试用例"""
+    test_functions = [
+        test_basic_translation,
+        test_error_recovery,
+        test_stream_translation,
+        test_batch_with_progress,
+        test_error_handling
+    ]
+
+    for test_func in test_functions:
+        print(f"\n运行测试: {test_func.__name__}")
+        print("=" * 50)
+        try:
+            await test_func()
+            print(f"✓ {test_func.__name__} 测试通过")
+        except Exception as e:
+            print(f"✗ {test_func.__name__} 测试失败: {str(e)}")
+        print("=" * 50)
+
 if __name__ == "__main__":
-    # 运行示例测试
-    test_examples()
+    import asyncio
+    asyncio.run(run_tests())
