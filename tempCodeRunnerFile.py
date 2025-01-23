@@ -1,1 +1,0 @@
-model = self.ui.buttonGroup.checkedButton().text()
