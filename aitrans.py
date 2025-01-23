@@ -332,12 +332,37 @@ class BatchProcessor:
     """处理批量任务"""
 
     def __init__(self, max_workers: int = 5, batch_size: int = 10):
+        """初始化批处理器
+
+        Args:
+            max_workers: 最大并发工作数
+            batch_size: 每批处理的任务数
+        """
         self.max_workers = max_workers
         self.batch_size = batch_size
         self.semaphore = asyncio.Semaphore(max_workers)
+        self._is_initialized = False
+
+    async def initialize(self):
+        """初始化处理器"""
+        if not self._is_initialized:
+            # 这里可以添加额外的初始化逻辑
+            self._is_initialized = True
+            logger.debug("BatchProcessor initialized")
 
     async def process(self, items: list, processor_func) -> list:
-        """处理批量任务"""
+        """处理批量任务
+
+        Args:
+            items: 要处理的项目列表
+            processor_func: 处理单个项目的异步函数
+
+        Returns:
+            处理结果列表
+        """
+        if not self._is_initialized:
+            await self.initialize()
+
         results = []
         for i in range(0, len(items), self.batch_size):
             batch = items[i:i + self.batch_size]
@@ -352,7 +377,8 @@ class BatchProcessor:
 
     async def stop(self):
         """停止处理器"""
-        pass
+        self._is_initialized = False
+        logger.debug("BatchProcessor stopped")
 
 
 class AITranslator:
@@ -499,6 +525,7 @@ class AITranslator:
 
         # 术语表初始化
         self.glossary: Dict[str, Dict[str, str]] = {}
+        self.glossary_path = glossary_path  # 保存术语表路径
         if glossary_path:
             self.load_glossary(glossary_path)
 
@@ -507,6 +534,12 @@ class AITranslator:
 
         # 性能监控 - 确保在这里初始化
         self.metrics = PerformanceMetrics()
+
+        # 批处理器初始化
+        self.batch_processor = BatchProcessor(
+            max_workers=self.perf_config['max_workers'],
+            batch_size=10  # 可以从 perf_config 中获取或使用默认值
+        )
 
         # 异步组件
         self.session = None
@@ -568,25 +601,24 @@ class AITranslator:
         retry=retry_if_exception_type(
             (openai.APIError, openai.APIConnectionError, httpx.ConnectError))
     )
-
     async def initialize(self):
         """初始化异步资源"""
         try:
             # 初始化会话管理器
             await self.session_manager.initialize()
-            
+
             # 初始化客户端管理器
             await self.client_manager.initialize()
-            
+
             # 初始化批处理器
             await self.batch_processor.initialize()
-            
+
             # 加载术语表（如果有）
             if self.glossary_path:
                 self.load_glossary(self.glossary_path)
-                
+
             logger.info("AITranslator initialized successfully")
-            
+
         except Exception as e:
             logger.error(f"初始化失败: {str(e)}")
             raise AIError(f"初始化失败: {str(e)}")
@@ -620,10 +652,12 @@ class AITranslator:
                             timeout=self.perf_config['timeout']
                         )
                     except openai.AuthenticationError as e:
-                        self.metrics.record_request(time.time() - start_time, False)
+                        self.metrics.record_request(
+                            time.time() - start_time, False)
                         raise AIAuthenticationError(f"API认证失败: {str(e)}")
                     except openai.APIError as e:
-                        self.metrics.record_request(time.time() - start_time, False)
+                        self.metrics.record_request(
+                            time.time() - start_time, False)
                         if "auth" in str(e).lower():
                             raise AIAuthenticationError(f"API认证失败: {str(e)}")
                         raise
@@ -636,7 +670,8 @@ class AITranslator:
                         return completion
                     else:
                         if hasattr(completion, 'choices') and completion.choices:
-                            result = completion.choices[0].message.content.strip()
+                            result = completion.choices[0].message.content.strip(
+                            )
                             self.metrics.record_request(duration, True)
                             return result
                         else:
@@ -943,12 +978,12 @@ class AITranslator:
             try:
                 start_time = time.time()
                 response_stream = await self._make_request(messages, stream=True)
-                
+
                 async for chunk in response_stream:
                     if chunk.choices and chunk.choices[0].delta.content:
                         translated_text += chunk.choices[0].delta.content
                         yield AITranslated(src, dest, text, translated_text)
-                
+
                 # 记录成功的请求
                 duration = time.time() - start_time
                 self.metrics.record_request(duration, True)
@@ -959,12 +994,13 @@ class AITranslator:
                 self.metrics.record_request(duration, False)
                 last_error = e
                 retry_count += 1
-                
+
                 if retry_count > self.max_retries:
                     logger.error(f"流式翻译失败，已重试 {self.max_retries} 次: {str(e)}")
                     raise AIAPIError(f"流式翻译失败: {str(e)}")
-                
-                logger.warning(f"第 {retry_count}/{self.max_retries} 次重试，原因: {str(e)}")
+
+                logger.warning(
+                    f"第 {retry_count}/{self.max_retries} 次重试，原因: {str(e)}")
                 await asyncio.sleep(min(2 ** retry_count, 10))  # 指数退避，最大等待10秒
 
         if last_error:
@@ -979,30 +1015,30 @@ class AITranslator:
         try:
             # 设置随机种子确保结果一致性
             DetectorFactory.seed = 0
-            
+
             # 使用 langdetect 进行检测
             detected_langs = detect_langs(text)
-            
+
             if not detected_langs:
                 logger.warning("无法检测语言，返回 auto")
                 return AIDetected('auto', 0.0)
-                
+
             # 获取最可能的语言
             most_probable = detected_langs[0]
             lang_code = most_probable.lang
             confidence = most_probable.prob
-            
+
             # 标准化语言代码
             normalized_lang = LANG_CODE_MAP.get(lang_code, lang_code)
-            
+
             # 验证语言是否支持
             if normalized_lang not in DOUBAO_LANGUAGES:
                 logger.warning(f"检测到不支持的语言: {normalized_lang}，返回 auto")
                 return AIDetected('auto', 0.0)
-            
+
             logger.info(f"语言检测结果: {normalized_lang}, 置信度: {confidence:.2f}")
             return AIDetected(normalized_lang, confidence)
-            
+
         except LangDetectException as e:
             logger.error(f"语言检测失败: {str(e)}")
             return AIDetected('auto', 0.0)
@@ -1465,19 +1501,23 @@ class AITranslator:
             # 清理会话管理器
             if hasattr(self, 'session_manager') and self.session_manager:
                 await self.session_manager.cleanup()
-            
+
             # 清理客户端管理器
             if hasattr(self, 'client_manager') and self.client_manager:
                 await self.client_manager.cleanup()
-            
+
+            # 清理批处理器
+            if hasattr(self, 'batch_processor'):
+                await self.batch_processor.stop()
+
             # 清理缓存
             if hasattr(self, '_response_cache'):
                 self._response_cache.clear()
             if hasattr(self, '_context_cache'):
                 self._context_cache.clear()
-                
+
             logger.info("AITranslator resources cleaned up successfully")
-            
+
         except Exception as e:
             logger.error(f"清理资源失败: {str(e)}")
             raise AIError(f"清理资源失败: {str(e)}")
@@ -1662,7 +1702,7 @@ class AITranslatorSync:
             if not self._loop:
                 self._loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(self._loop)
-            
+
             # 创建异步翻译器实例
             self.translator = AITranslator(
                 api_key=self.api_key,
@@ -1673,7 +1713,7 @@ class AITranslatorSync:
                 performance_mode=self.performance_mode,
                 **self.kwargs
             )
-            
+
             # 初始化异步翻译器
             self._loop.run_until_complete(self.translator.initialize())
             self._initialized = True
@@ -1696,15 +1736,15 @@ class AITranslatorSync:
     def quick_translate(text: str, dest: str = 'en', src: str = 'auto') -> str:
         """
         快速翻译方法，无需手动创建实例
-        
+
         Args:
             text: 要翻译的文本
             dest: 目标语言代码
             src: 源语言代码，默认自动检测
-            
+
         Returns:
             str: 翻译后的文本
-            
+
         Example:
             result = AITranslatorSync.quick_translate("你好", dest="en")
             print(result)  # 输出: "Hello"
@@ -1729,7 +1769,7 @@ class AITranslatorSync:
         """上下文管理器入口（自动初始化）"""
         self._ensure_translator()
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         """自动清理资源"""
         try:
@@ -1781,7 +1821,8 @@ class AITranslatorSync:
         """带上下文的翻译方法"""
         self._ensure_translator()
         return self._loop.run_until_complete(
-            self.translator.translate_with_context(text, context, dest=dest, src=src)
+            self.translator.translate_with_context(
+                text, context, dest=dest, src=src)
         )
 
     def preconnect(self):
@@ -1798,7 +1839,8 @@ class AITranslatorSync:
         """评估翻译质量"""
         self._ensure_translator()
         return self._loop.run_until_complete(
-            self.translator.evaluate_translation(original, translated, src, dest)
+            self.translator.evaluate_translation(
+                original, translated, src, dest)
         )
 
     def get_config(self):
@@ -1815,6 +1857,7 @@ class AITranslatorSync:
         """析构时确保资源被清理"""
         if self._initialized:
             self.__exit__(None, None, None)
+
 
 def create(api_key=None, model_name=None, base_url=None, performance_mode='balanced', **kwargs) -> 'AITranslatorSync':
     """
@@ -1850,7 +1893,7 @@ def create(api_key=None, model_name=None, base_url=None, performance_mode='balan
 
 def test_examples():
     """展示各种使用场景的示例"""
-    
+
     print("\n===== 1. 快速翻译（一行代码）=====")
     try:
         # 最简单的使用方式
@@ -1865,7 +1908,7 @@ def test_examples():
         translator = create(performance_mode='fast')
         result = translator.translate("这是一个测试", dest="en")
         print(f"工厂方法创建的翻译器结果: {result.text}")
-        
+
         # 获取性能指标
         metrics = translator.get_metrics()
         print("性能指标:", json.dumps(metrics, indent=2, ensure_ascii=False))
@@ -1913,7 +1956,7 @@ def test_examples():
         with create() as translator:
             text = "这个产品非常好用"
             print(f"原文: {text}")
-            
+
             # 测试不同风格
             styles = ['formal', 'casual', 'creative']
             for style in styles:
@@ -1944,7 +1987,7 @@ def test_examples():
         modes = ['fast', 'balanced', 'accurate']
         text = "这是一个测试句子"
         print(f"原文: {text}")
-        
+
         for mode in modes:
             with create(performance_mode=mode) as translator:
                 start_time = time.time()
@@ -1979,7 +2022,7 @@ def test_examples():
     except Exception as e:
         print(f"错误处理测试失败: {e}")
 
+
 if __name__ == "__main__":
     # 运行示例测试
     test_examples()
-
