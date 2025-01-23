@@ -7,6 +7,7 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
+from collections import defaultdict
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from langdetect import detect_langs, DetectorFactory
 from langdetect.lang_detect_exception import LangDetectException
@@ -19,6 +20,7 @@ import httpx
 import threading
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
+
 try:
     from collections.abc import MutableSet
 except ImportError:
@@ -421,6 +423,7 @@ class BatchProcessor:
 
 class SmartBatchProcessor:
     """智能批处理处理器，支持基于token的动态批处理"""
+
     def __init__(self, max_batch_size=10, max_tokens=4000):
         self.max_batch_size = max_batch_size
         self.max_tokens = max_tokens
@@ -442,7 +445,7 @@ class SmartBatchProcessor:
     def can_add_to_batch(self, text: str) -> bool:
         """检查是否可以添加到当前批次"""
         estimated_tokens = self.estimate_tokens(text)
-        return (len(self.current_batch) < self.max_batch_size and 
+        return (len(self.current_batch) < self.max_batch_size and
                 self.current_tokens + estimated_tokens <= self.max_tokens)
 
     def add_to_batch(self, text: str) -> bool:
@@ -471,6 +474,7 @@ class SmartBatchProcessor:
 
 class DynamicRateLimiter:
     """动态请求限流控制器"""
+
     def __init__(self, initial_rate=10, max_rate=20):
         self.current_rate = initial_rate
         self.max_rate = max_rate
@@ -493,7 +497,8 @@ class DynamicRateLimiter:
             if success:
                 self.success_count += 1
                 if self.success_count > 10 and self.current_rate < self.max_rate:
-                    self.current_rate = min(self.current_rate * 1.2, self.max_rate)
+                    self.current_rate = min(
+                        self.current_rate * 1.2, self.max_rate)
             else:
                 self.failure_count += 1
                 if self.failure_count > 2:
@@ -507,6 +512,7 @@ class DynamicRateLimiter:
 
 class SmartRetryHandler:
     """智能重试处理器"""
+
     def __init__(self):
         self.error_counts = defaultdict(int)
         self.last_errors = defaultdict(list)
@@ -516,18 +522,18 @@ class SmartRetryHandler:
         """判断是否应该重试并返回等待时间"""
         error_type = type(error).__name__
         self.error_counts[error_type] += 1
-        
+
         if self.error_counts[error_type] > self.max_retries:
             return False, 0
 
         if isinstance(error, (openai.APIError, httpx.ConnectError)):
             wait_time = min(2 ** self.error_counts[error_type], 32)
             return True, wait_time
-            
+
         if isinstance(error, openai.RateLimitError):
             wait_time = 60  # 固定等待时间
             return True, wait_time
-            
+
         return False, 0
 
     def reset_error_count(self, error_type: str):
@@ -537,6 +543,7 @@ class SmartRetryHandler:
 
 class EnhancedCache:
     """增强的缓存实现"""
+
     def __init__(self, ttl=3600):
         self.cache = {}
         self.ttl = ttl
@@ -844,9 +851,9 @@ class AITranslator:
         async with self._request_lock:
             # 使用动态限流
             await self.rate_limiter.wait()
-            
+
             start_time = time.time()
-            
+
             try:
                 # 检查缓存
                 cache_key = self._get_cache_key(messages)
@@ -871,26 +878,27 @@ class AITranslator:
                             max_tokens=self.perf_config['max_tokens'],
                             timeout=self.perf_config['timeout']
                         )
-                        
+
                         # 记录成功并调整速率
                         await self.rate_limiter.adjust_rate(True)
-                        
+
                         # 缓存响应
                         if not stream:
                             await self.enhanced_cache.put(cache_key, completion)
-                            
+
                         return completion
-                        
+
                     except Exception as e:
                         # 记录失败并调整速率
                         await self.rate_limiter.adjust_rate(False)
-                        
+
                         # 智能重试处理
-                        should_retry, wait_time = self.retry_handler.should_retry(e)
+                        should_retry, wait_time = self.retry_handler.should_retry(
+                            e)
                         if should_retry:
                             await asyncio.sleep(wait_time)
                             return await self._make_request(messages, stream)
-                            
+
                         raise
 
             finally:
@@ -898,7 +906,7 @@ class AITranslator:
                 await self._record_metrics(duration, True)
 
     async def translate_batch(self, texts: List[str], dest='en', src='auto',
-                          progress_callback: Callable[[TranslationProgress], None] = None):
+                              progress_callback: Callable[[TranslationProgress], None] = None):
         """改进的批量翻译实现"""
         results = []
         total_texts = len(texts)
@@ -907,13 +915,13 @@ class AITranslator:
         async def process_batch(batch: List[str]) -> List[AITranslated]:
             nonlocal completed
             batch_results = []
-            
+
             for text in batch:
                 try:
                     result = await self._translate_single(text, dest, src)
                     batch_results.append(result)
                     completed += 1
-                    
+
                     if progress_callback:
                         progress = TranslationProgress(
                             completed=completed,
@@ -921,23 +929,23 @@ class AITranslator:
                             current_text=text
                         )
                         progress_callback(progress)
-                        
+
                 except Exception as e:
                     logger.error(f"批量翻译错误: {str(e)}")
                     batch_results.append(None)
                     completed += 1
-                    
+
             return batch_results
 
         # 使用智能批处理
         for text in texts:
             if self.smart_batch_processor.add_to_batch(text):
                 continue
-                
+
             # 当前批次已满，处理它
             batch_results = await self.smart_batch_processor.process_batch(process_batch)
             results.extend(batch_results)
-            
+
             # 添加新文本到新批次
             self.smart_batch_processor.add_to_batch(text)
 
