@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from collections import defaultdict
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -22,13 +23,63 @@ class BatchProcessor:
     async def initialize(self) -> None:
         self._is_initialized = True
 
-    async def process(self, items: List[Any], processor: Callable[[Any], Any]) -> List[Any]:
+    async def process(
+        self,
+        items: Sequence[Any],
+        processor: Callable[[Any], Any],
+        *,
+        batch_size: Optional[int] = None,
+        max_workers: Optional[int] = None,
+    ) -> List[Any]:
         if not self._is_initialized:
             await self.initialize()
 
-        results = []
-        for item in items:
-            results.append(await processor(item))
+        if not items:
+            return []
+
+        effective_workers = max(1, max_workers if max_workers is not None else self.max_workers)
+        semaphore = asyncio.Semaphore(effective_workers)
+        batch_limit = max(1, batch_size if batch_size is not None else self.batch_size)
+        results: List[Any] = [None] * len(items)
+
+        run_sync_in_thread = not inspect.iscoroutinefunction(processor)
+
+        async def run(index: int, item: Any) -> Tuple[int, Any]:
+            async with semaphore:
+                if run_sync_in_thread:
+                    value = await asyncio.to_thread(processor, item)
+                else:
+                    value = await processor(item)  # type: ignore[arg-type]
+                if inspect.isawaitable(value):
+                    value = await value
+                return index, value
+
+        pending: Set[asyncio.Task[Tuple[int, Any]]] = set()
+
+        def _drain(completed: Iterable[asyncio.Task[Tuple[int, Any]]]) -> None:
+            for task in completed:
+                index, value = task.result()
+                results[index] = value
+
+        try:
+            for index, item in enumerate(items):
+                pending.add(asyncio.create_task(run(index, item)))
+                if len(pending) >= batch_limit:
+                    done, pending = await asyncio.wait(
+                        pending, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    _drain(done)
+
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.ALL_COMPLETED)
+                _drain(done)
+        except Exception:
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            raise
+
         return results
 
     async def stop(self) -> None:

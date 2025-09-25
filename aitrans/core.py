@@ -89,7 +89,8 @@ class AITranslator:
         )
 
         self.metrics = PerformanceMetrics()
-        self.batch_processor = BatchProcessor(max_workers=max_workers)
+        perf_workers = int(self.perf_config.get("max_workers", max_workers))
+        self.batch_processor = BatchProcessor(max_workers=perf_workers)
         self.smart_batch_processor = SmartBatchProcessor()
         self.rate_limiter = DynamicRateLimiter()
         self.retry_handler = SmartRetryHandler()
@@ -272,9 +273,21 @@ class AITranslator:
         return None
 
     def _fallback_detect(self, text: str) -> AIDetected:
-        ascii_ratio = sum(1 for ch in text if ch.isascii()) / max(len(text), 1)
+        total_chars = len(text)
+        if total_chars == 0:
+            return AIDetected("auto", 0.0)
+
+        ascii_count = 0
+        has_cjk = False
+        for ch in text:
+            if ch.isascii():
+                ascii_count += 1
+            elif not has_cjk and "\u4e00" <= ch <= "\u9fff":
+                has_cjk = True
+
+        ascii_ratio = ascii_count / total_chars
         if ascii_ratio > 0.8:
             return AIDetected("en", 0.9)
-        if any("\u4e00" <= ch <= "\u9fff" for ch in text):
+        if has_cjk:
             return AIDetected("zh", 0.9)
         return AIDetected("auto", 0.0)
