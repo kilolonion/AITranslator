@@ -42,9 +42,10 @@ class MultiLevelCache:
         return "::".join(key_parts)
 
     async def get(self, key: str) -> Optional[Any]:
+        now = time.time()
         async with self._lock:
             item = self._memory_cache.get(key)
-            if item and item.expire_at > time.time():
+            if item and item.expire_at > now:
                 return item.value
             if item:
                 del self._memory_cache[key]
@@ -53,23 +54,28 @@ class MultiLevelCache:
             return None
 
         cache_file = self._file_cache_path / f"{key}.json"
-        if not cache_file.exists():
+        try:
+            raw = await asyncio.to_thread(cache_file.read_text)
+        except FileNotFoundError:
+            return None
+        except OSError:
             return None
 
         try:
-            data = json.loads(cache_file.read_text())
+            data = json.loads(raw)
         except json.JSONDecodeError:
-            cache_file.unlink(missing_ok=True)
+            await asyncio.to_thread(cache_file.unlink, missing_ok=True)
             return None
 
-        if data.get("expire_at", 0) <= time.time():
-            cache_file.unlink(missing_ok=True)
+        expire_at = data.get("expire_at", 0)
+        if expire_at <= time.time():
+            await asyncio.to_thread(cache_file.unlink, missing_ok=True)
             return None
 
         value = data.get("value")
         metadata = data.get("metadata", {})
         async with self._lock:
-            self._memory_cache[key] = CacheItem(value, data["expire_at"], metadata)
+            self._memory_cache[key] = CacheItem(value, expire_at, metadata)
         return value
 
     async def set(
@@ -93,17 +99,21 @@ class MultiLevelCache:
 
         cache_file = self._file_cache_path / f"{key}.json"
         try:
-            cache_file.write_text(
-                json.dumps(
-                    {
-                        "value": value,
-                        "expire_at": expire_at,
-                        "metadata": cache_item.metadata,
-                    }
-                )
+            payload = json.dumps(
+                {
+                    "value": value,
+                    "expire_at": expire_at,
+                    "metadata": cache_item.metadata,
+                }
             )
         except TypeError:
-            cache_file.unlink(missing_ok=True)
+            await asyncio.to_thread(cache_file.unlink, missing_ok=True)
+            return
+
+        try:
+            await asyncio.to_thread(cache_file.write_text, payload)
+        except OSError:
+            await asyncio.to_thread(cache_file.unlink, missing_ok=True)
 
     async def clear(self) -> None:
         async with self._lock:
@@ -113,7 +123,7 @@ class MultiLevelCache:
             return
 
         for file in self._file_cache_path.glob("*.json"):
-            file.unlink(missing_ok=True)
+            await asyncio.to_thread(file.unlink, missing_ok=True)
 
 
 class SyncMultiLevelCache:
